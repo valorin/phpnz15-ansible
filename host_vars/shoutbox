@@ -1,0 +1,5 @@
+---
+
+ansible_ssh_user: root
+
+repository: https://github.com/valorin/phpnz15-shoutbox

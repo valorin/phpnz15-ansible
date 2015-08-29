@@ -1,0 +1,151 @@
+---
+- hosts: servers
+  become: yes
+
+  tasks:
+
+    - name: install packages
+      apt: name={{ item }} state=latest update_cache=yes cache_valid_time=3600
+      with_items:
+        - git
+        - mcrypt
+        - nginx
+        - php5-cli
+        - php5-curl
+        - php5-fpm
+        - php5-intl
+        - php5-json
+        - php5-mcrypt
+        - php5-sqlite
+        - mysql-server
+        - mysql-client
+        - php5-mysql
+        - python-mysqldb
+        - makepasswd
+
+    - name: enable php5 mcrypt
+      shell: php5enmod mcrypt
+      args:
+        creates: /etc/php5/cli/conf.d/20-mcrypt.ini
+
+    - name: enable ufw
+      ufw: direction=incoming policy=deny state=enabled
+
+    - name: ufw limit ssh
+      ufw: rule=limit port=ssh
+
+    - name: ufw allow http
+      ufw: rule=allow port=http
+
+    - name: ensure php5-fpm cgi.fix_pathinfo=0
+      lineinfile: >
+        dest=/etc/php5/fpm/php.ini
+        regexp='^(.*)cgi.fix_pathinfo='
+        line=cgi.fix_pathinfo=0
+      notify:
+        - restart nginx
+        - restart php5-fpm
+
+    - name: create /var/www/app/
+      file: >
+        dest=/var/www/app/ state=directory
+        owner=www-data group=www-data mode=0700
+
+    - name: nginx config
+      template: src=nginx.conf dest=/etc/nginx/sites-available/default
+      notify:
+        - restart php5-fpm
+        - restart nginx
+
+    - name: clone repository
+      git: >
+        dest=/var/www/app
+        repo={{ repository }}
+      become: yes
+      become_user: www-data
+      register: cloned
+
+    - name: install composer
+      shell: >
+        curl -sS https://getcomposer.org/installer |
+        php -- --install-dir=/usr/local/bin --filename=composer
+      args:
+        creates: /usr/local/bin/composer
+
+    - name: composer create-project
+      shell: composer create-project --no-interaction
+      args:
+        chdir: /var/www/app
+      become: yes
+      become_user: www-data
+      when: cloned|changed
+
+    - name: set env debug false
+      lineinfile: >
+        dest=/var/www/app/.env
+        regexp='^APP_DEBUG='
+        line=APP_DEBUG=false
+
+    - name: set env production
+      lineinfile: >
+        dest=/var/www/app/.env
+        regexp='^APP_ENV='
+        line=APP_ENV=production
+
+    - name: create db
+      mysql_db: name=app
+
+    - name: generate db password
+      shell: makepasswd --chars=32
+      register: dbpwd
+      when: cloned|changed
+
+    - name: create db user
+      mysql_user: name=app password={{ dbpwd.stdout }} priv=app.*:ALL
+      when: dbpwd.changed
+
+    - name: set env db name
+      lineinfile: >
+        dest=/var/www/app/.env
+        regexp='^DB_DATABASE='
+        line=DB_DATABASE=app
+
+    - name: set env db username
+      lineinfile: >
+        dest=/var/www/app/.env
+        regexp='^DB_USERNAME='
+        line=DB_USERNAME=app
+
+    - name: set env db password
+      lineinfile: >
+        dest=/var/www/app/.env
+        regexp='^DB_PASSWORD='
+        line=DB_PASSWORD={{ dbpwd.stdout }}
+      when: dbpwd.changed
+
+    - name: run artisan migrate
+      shell: php /var/www/app/artisan migrate --force
+      become: yes
+      become_user: www-data
+      when: cloned|changed
+
+    - name: enable artisan scheduler
+      cron: >
+        job="php /var/www/app/artisan schedule:run 1>> /dev/null 2>&1"
+        state=present
+        user=www-data
+        name="Laravel Scheduler"
+
+    - name: enable queue worker
+      cron: >
+        job="run-one php /var/www/app/artisan queue:work --daemon 1>> /dev/null 2>&1"
+        state=present
+        user=www-data
+        name="Laravel Queue Worker"
+
+  handlers:
+  - name: restart php5-fpm
+    shell: service php5-fpm restart
+
+  - name: restart nginx
+    service: name=nginx state=restarted
